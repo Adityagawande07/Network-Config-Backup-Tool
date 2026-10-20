@@ -1,1 +1,289 @@
+Cisco Router & Switch Configuration Backup Automation
+Automated backup of Cisco router and switch configurations using Python, Netmiko, and Linux cron. The system reads device inventory from an Excel spreadsheet, connects to devices over SSH through the management subnet, stores timestamped configuration backups, maintains version history, and detects configuration changes using file diffs.
 
+Features
+Excel inventory: Reads hostname, management IP, username, password, device type, and optional enable secret.
+SSH connectivity: Uses Netmiko to connect to Cisco routers and switches.
+Automated backups: Collects the running configuration using show running-config.
+Timestamped version history: Saves a new configuration file on every successful run without overwriting previous backups.
+Configuration change detection: Compares the latest configuration with the previous successful backup.
+Diff generation: Creates unified diff files when configuration changes are detected.
+Email alerts: Optionally sends email notifications with configuration diffs attached.
+Error handling: Continues processing other devices when a device connection or backup fails.
+Execution logging: Records backup results, configuration changes, and failures.
+Cron scheduling: Supports scheduled backups using Linux cron.
+Architecture
+
+                    Linux Backup Server
+                   +---------------------+
+                   | Python Backup Script|
+                   | Netmiko + openpyxl  |
+                   | Diff Detection      |
+                   | Logging / Alerts    |
+                   +----------+----------+
+                              |
+                      Management Subnet
+                              |
+               +--------------+--------------+
+               |                             |
+        +------v------+               +------v------+
+        | Cisco Router|               | Cisco Switch|
+        | Management IP              | Management IP|
+        +-------------+               +-------------+
+                              |
+                              v
+                    Local Backup Repository
+                    /var/backups/cisco/
+Technology Stack
+
+Component	Purpose
+Python 3	Backup automation
+Netmiko	SSH connectivity and Cisco CLI interaction
+openpyxl	Reading Excel inventory
+difflib	Configuration comparison and diff generation
+smtplib	Optional email notifications
+Linux cron	Scheduled execution
+Project Structure
+
+cisco-config-backup/
+├── cisco_backup.py
+├── devices.xlsx
+├── README.md
+├── requirements.txt
+└── logs/
+    ├── backup.log
+    └── cron.log
+
+/var/backups/cisco/
+├── CORE-SW-01/
+│   ├── <timestamp>_running-config.txt
+│   ├── <timestamp>_running-config.txt
+│   └── <timestamp>_changes.diff
+└── EDGE-RTR-01/
+    ├── <timestamp>_running-config.txt
+    └── <timestamp>_changes.diff
+The backup repository is separate from the Git project directory.
+
+Prerequisites
+Linux server with Python 3 installed.
+SSH reachability from the Linux server to the device management IP addresses.
+Cisco routers and switches with CLI access enabled.
+A dedicated device account authorized to execute show running-config.
+An Excel inventory file containing device credentials.
+Network access to an SMTP server if email alerts are required.
+Installation
+1. Clone the repository
+
+git clone <YOUR_GIT_REPOSITORY_URL>
+cd cisco-config-backup
+Replace the placeholder with your actual Git repository URL.
+
+2. Create a Python virtual environment
+
+python3 -m venv venv
+source venv/bin/activate
+3. Install dependencies
+Create a requirements.txt file:
+
+
+netmiko
+openpyxl
+Install the dependencies:
+
+
+pip install -r requirements.txt
+For reproducible deployments, pin and maintain tested dependency versions.
+
+4. Create directories
+
+sudo mkdir -p /var/backups/cisco
+mkdir -p logs
+Ensure the account running the script has appropriate permissions to write to the backup and log directories.
+
+Excel Inventory Configuration
+Create devices.xlsx with the following column headers in the first worksheet:
+
+
+hostname	ip	username	password	device_type	secret
+CORE-SW-01	10.10.10.11	backupuser	CHANGE_ME	cisco_ios	
+EDGE-RTR-01	10.10.10.21	backupuser	CHANGE_ME	cisco_ios	
+Column descriptions
+
+Column	Required	Description
+hostname	Yes	Device name used for backup folders
+ip	Yes	Device management IP address
+username	Yes	SSH username
+password	Yes	SSH password
+device_type	No	Netmiko platform identifier; defaults to cisco_ios
+secret	No	Enable password, if required
+Common Netmiko platform identifiers include cisco_ios and cisco_nxos. Confirm the appropriate identifier for your device and software platform.
+
+Security: Do not commit real device passwords, enable secrets, or other credentials to Git. For production use, retrieve credentials from a protected secrets store or an appropriately secured credential file.
+
+Configure the Backup Script
+Update the configuration variables at the beginning of cisco_backup.py if your paths differ:
+
+
+BASE_DIR = Path("/opt/cisco-backup")
+EXCEL_FILE = BASE_DIR / "devices.xlsx"
+BACKUP_ROOT = Path("/var/backups/cisco")
+LOG_DIR = BASE_DIR / "logs"
+Make sure the script's actual location matches BASE_DIR.
+
+The script retrieves the running configuration using:
+
+
+show running-config
+Each device's configuration is stored in a separate directory. Every successful backup receives a unique timestamped filename.
+
+Run the Backup Manually
+Activate the virtual environment and execute the script:
+
+
+source venv/bin/activate
+python cisco_backup.py
+Or execute it using the virtual environment's Python interpreter:
+
+
+/opt/cisco-backup/venv/bin/python \
+  /opt/cisco-backup/cisco_backup.py
+Check the exit status:
+
+
+echo $?
+Expected exit codes:
+
+0: All device backups succeeded.
+1: One or more device backups failed.
+2: The inventory could not be loaded or contained no valid devices.
+Backup Storage and Version History
+Backups are stored under:
+
+
+/var/backups/cisco/<hostname>/
+Example filenames:
+
+
+2026-10-20_120000_000000_+0530_running-config.txt
+2026-10-20_180000_000000_+0530_running-config.txt
+2026-10-20_180000_000000_+0530_changes.diff
+Timestamps use the server's local timezone, including its UTC offset.
+
+The script saves a new configuration file on every successful run. When a previous successful configuration exists, it compares the new configuration with that earlier version.
+
+If the configuration changed, a unified diff file is generated.
+If no changes are detected, the configuration is still saved, but no change diff is generated.
+The first backup establishes the baseline and has no earlier version to compare against.
+Configuration Change Alerts
+The script can optionally send email notifications through an SMTP server.
+
+Configure the following environment variables in a protected environment file or wrapper script:
+
+
+export BACKUP_SMTP_HOST="smtp.example.com"
+export BACKUP_SMTP_PORT="587"
+export BACKUP_SMTP_USER="backup-alerts@example.com"
+export BACKUP_SMTP_PASSWORD="SMTP_PASSWORD"
+export BACKUP_ALERT_FROM="backup-alerts@example.com"
+export BACKUP_ALERT_TO="network-team@example.com"
+Ensure the scheduled execution environment loads these variables. Cron does not automatically inherit environment variables from an interactive shell.
+
+When a configuration change is detected, the script logs the event and attempts to send an email with the diff attached. If SMTP is not configured, the change is still recorded locally.
+
+Schedule Automated Backups with Cron
+Edit the crontab for the account that runs the backup:
+
+
+crontab -e
+Example: schedule a backup every day at 6:00 PM.
+
+
+0 18 * * * /opt/cisco-backup/venv/bin/python /opt/cisco-backup/cisco_backup.py >> /opt/cisco-backup/logs/cron.log 2>&1
+Other examples:
+
+
+Schedule	Cron expression
+Daily at midnight	0 0 * * *
+Daily at 6:00 AM	0 6 * * *
+Daily at 6:00 PM	0 18 * * *
+Every six hours	0 */6 * * *
+Every Sunday at 2:00 AM	0 2 * * 0
+Cron uses the server's configured timezone. Check it using:
+
+
+timedatectl
+Verify the scheduled job using:
+
+
+crontab -l
+Logging and Troubleshooting
+The application log is stored at:
+
+
+/opt/cisco-backup/logs/backup.log
+Cron output is stored at:
+
+
+/opt/cisco-backup/logs/cron.log
+Follow the application log:
+
+
+tail -f /opt/cisco-backup/logs/backup.log
+Common troubleshooting steps:
+
+Verify management subnet connectivity and routing.
+Verify SSH access to the device management IP.
+Check device credentials and enable privileges.
+Confirm the Netmiko device_type matches the target platform.
+Verify the Excel column headers and required values.
+Confirm write permissions on the backup and log directories.
+Check SMTP settings and network access if email alerts fail.
+Verify the cron environment uses the correct Python interpreter and configuration paths.
+Security Considerations
+Use a dedicated least-privilege device account.
+Restrict access to the Excel inventory and any credential files.
+Do not commit passwords, SMTP credentials, or sensitive configurations to Git.
+Use SSH host-key verification or another approved server-identity validation mechanism for production deployments.
+Restrict access to the backup repository because device configurations may contain sensitive information.
+Encrypt backup storage and secure off-server copies.
+Define and implement a backup retention policy.
+Test recovery and configuration comparison procedures regularly.
+Limitations
+The script backs up the running configuration; it does not automatically save the Cisco startup configuration.
+It requires management network reachability and working SSH credentials.
+Email alerts require a correctly configured SMTP service.
+Configuration diffs are text-based and may include changes caused by ordering or device-generated output.
+Backup retention and archival policies must be configured separately.
+Production deployments should test platform compatibility, command output, and privilege requirements.
+Future Enhancements
+Support for Cisco IOS-XE, NX-OS, and additional network platforms.
+Encrypted credential management.
+Configurable retention and automatic archival.
+Failure notification and summary reports.
+Centralized monitoring dashboard.
+Backup integrity checks and encrypted off-site replication.
+Support for additional commands, such as show startup-config, where required.
+License
+Add the license appropriate for your project before distributing or publishing this repository.
+
+Before you push to Git
+Create a .gitignore file to prevent local credentials, logs, and backup data from being committed:
+
+
+gitignore
+venv/
+__pycache__/
+*.py[cod]
+.env
+*.xlsx
+logs/
+*.log
+This excludes all Excel files; if you intend to commit a sanitized sample inventory, use a sample file with fake credentials and adjust the ignore rule accordingly.
+
+Then commit the documentation and code:
+
+
+bash
+git add README.md requirements.txt cisco_backup.py .gitignore
+git commit -m "Add automated Cisco configuration backup"
+git push
