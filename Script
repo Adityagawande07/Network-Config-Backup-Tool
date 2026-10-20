@@ -1,0 +1,327 @@
+
+#!/usr/bin/env python3
+
+import difflib
+import logging
+import os
+import re
+import smtplib
+import ssl
+import sys
+
+from datetime import datetime
+from email.message import EmailMessage
+from pathlib import Path
+
+from netmiko import ConnectHandler
+from openpyxl import load_workbook
+
+
+# --------------------------------------------------
+# CONFIGURATION
+# --------------------------------------------------
+
+BASE_DIR = Path("/opt/cisco-backup")
+EXCEL_FILE = BASE_DIR / "devices.xlsx"
+BACKUP_ROOT = Path("/var/backups/cisco")
+LOG_DIR = BASE_DIR / "logs"
+
+CONNECT_TIMEOUT = 15
+COMMAND_TIMEOUT = 120
+
+# Optional: configure SMTP environment variables to
+# email notifications when configuration changes occur.
+SMTP_HOST = os.getenv("BACKUP_SMTP_HOST")
+SMTP_PORT = int(os.getenv("BACKUP_SMTP_PORT", "587"))
+SMTP_USER = os.getenv("BACKUP_SMTP_USER")
+SMTP_PASSWORD = os.getenv("BACKUP_SMTP_PASSWORD")
+ALERT_FROM = os.getenv("BACKUP_ALERT_FROM")
+ALERT_TO = os.getenv("BACKUP_ALERT_TO")
+
+
+# --------------------------------------------------
+# LOGGING
+# --------------------------------------------------
+
+LOG_DIR.mkdir(parents=True, exist_ok=True)
+BACKUP_ROOT.mkdir(parents=True, exist_ok=True)
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(message)s",
+    handlers=[
+        logging.FileHandler(LOG_DIR / "backup.log"),
+        logging.StreamHandler(sys.stdout),
+    ],
+)
+log = logging.getLogger("cisco_backup")
+
+
+def safe_name(value):
+    """Prevent hostnames from creating unintended paths."""
+    value = str(value).strip()
+    return re.sub(r"[^A-Za-z0-9_.-]", "_", value)
+
+
+def read_devices():
+    """Load the device inventory from the first worksheet."""
+    if not EXCEL_FILE.is_file():
+        raise FileNotFoundError(
+            f"Excel inventory not found: {EXCEL_FILE}"
+        )
+
+    workbook = load_workbook(
+        EXCEL_FILE, read_only=True, data_only=True
+    )
+    try:
+        sheet = workbook.active
+        rows = sheet.iter_rows(values_only=True)
+
+        headers = next(rows, None)
+        if not headers:
+            raise ValueError("Excel inventory is empty")
+
+        headers = [
+            str(h).strip().lower() if h is not None else ""
+            for h in headers
+        ]
+
+        required = {"hostname", "ip", "username", "password"}
+        missing = required - set(headers)
+        if missing:
+            raise ValueError(
+                "Missing Excel columns: " + ", ".join(sorted(missing))
+            )
+
+        devices = []
+        for row_number, values in enumerate(rows, start=2):
+            record = dict(zip(headers, values))
+
+            # Ignore completely empty rows.
+            if not any(v is not None for v in values):
+                continue
+
+            def field(name, default=""):
+                value = record.get(name)
+                return default if value is None else str(value).strip()
+
+            hostname = field("hostname")
+            ip = field("ip")
+            username = field("username")
+            password = field("password")
+
+            if not all([hostname, ip, username, password]):
+                log.error(
+                    "Skipping Excel row %s: required value missing",
+                    row_number,
+                )
+                continue
+
+            devices.append({
+                "hostname": hostname,
+                "ip": ip,
+                "username": username,
+                "password": password,
+                "device_type": field("device_type", "cisco_ios")
+                    or "cisco_ios",
+                "secret": field("secret"),
+            })
+
+        return devices
+    finally:
+        workbook.close()
+
+
+def send_change_email(hostname, ip, diff_path):
+    """Email an alert if SMTP is configured."""
+    if not all([SMTP_HOST, ALERT_FROM, ALERT_TO]):
+        log.info(
+            "Email not configured; change recorded for %s",
+            hostname,
+        )
+        return
+
+    message = EmailMessage()
+    message["Subject"] = f"Cisco configuration changed: {hostname}"
+    message["From"] = ALERT_FROM
+    message["To"] = ALERT_TO
+    message.set_content(
+        f"Configuration change detected.\n\n"
+        f"Hostname: {hostname}\n"
+        f"Management IP: {ip}\n"
+        f"Diff file: {diff_path}\n"
+        f"Server time: {datetime.now().astimezone().isoformat()}\n"
+    )
+
+    # Attach the diff so the actual changes can be reviewed.
+    message.add_attachment(
+        diff_path.read_text(encoding="utf-8", errors="replace"),
+        subtype="plain",
+        filename=diff_path.name,
+    )
+
+    try:
+        with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=20) as smtp:
+            smtp.starttls(context=ssl.create_default_context())
+
+            if SMTP_USER:
+                smtp.login(SMTP_USER, SMTP_PASSWORD or "")
+
+            smtp.send_message(message)
+
+        log.info("Change email sent for %s", hostname)
+    except Exception:
+        # A mail failure must not erase or invalidate a backup.
+        log.exception("Failed to send change email for %s", hostname)
+
+
+def get_previous_backup(device_dir):
+    """Find the latest earlier successful backup."""
+    backups = sorted(
+        device_dir.glob("*_running-config.txt")
+    )
+    return backups[-1] if backups else None
+
+
+def backup_device(device):
+    hostname = device["hostname"]
+    ip = device["ip"]
+    device_dir = BACKUP_ROOT / safe_name(hostname)
+    device_dir.mkdir(parents=True, exist_ok=True)
+
+    # Include microseconds to avoid filename collisions.
+    timestamp = datetime.now().astimezone().strftime(
+        "%Y-%m-%d_%H%M%S_%f_%z"
+    )
+
+    backup_path = device_dir / f"{timestamp}_running-config.txt"
+    diff_path = device_dir / f"{timestamp}_changes.diff"
+
+    log.info("Connecting to %s (%s)", hostname, ip)
+    connection = None
+    temp_path = backup_path.with_suffix(".tmp")
+
+    try:
+        params = {
+            "device_type": device["device_type"],
+            "host": ip,
+            "username": device["username"],
+            "password": device["password"],
+            "conn_timeout": CONNECT_TIMEOUT,
+            "auth_timeout": CONNECT_TIMEOUT,
+            "banner_timeout": CONNECT_TIMEOUT,
+        }
+
+        if device["secret"]:
+            params["secret"] = device["secret"]
+
+        connection = ConnectHandler(**params)
+
+        if device["secret"]:
+            connection.enable()
+
+        config = connection.send_command(
+            "show running-config",
+            read_timeout=COMMAND_TIMEOUT,
+            strip_prompt=True,
+            strip_command=True,
+        )
+
+        if not config or not config.strip():
+            raise RuntimeError("Device returned an empty configuration")
+
+        config = config.rstrip() + "\n"
+
+        # Do not leave a partial backup if writing fails.
+        temp_path.write_text(config, encoding="utf-8")
+        temp_path.replace(backup_path)
+
+        log.info("Backup saved: %s", backup_path)
+
+        # Compare against the most recent backup before this run.
+        previous = get_previous_backup(device_dir)
+        if previous is None:
+            log.info("Initial backup for %s; no comparison available",
+                     hostname)
+            return True
+
+        old_config = previous.read_text(
+            encoding="utf-8", errors="replace"
+        ).splitlines(keepends=True)
+
+        new_config = config.splitlines(keepends=True)
+
+        diff = list(difflib.unified_diff(
+            old_config,
+            new_config,
+            fromfile=previous.name,
+            tofile=backup_path.name,
+        ))
+
+        if diff:
+            diff_path.write_text("".join(diff), encoding="utf-8")
+            log.warning(
+                "CONFIGURATION CHANGE: %s (%s). Diff: %s",
+                hostname, ip, diff_path,
+            )
+            send_change_email(hostname, ip, diff_path)
+        else:
+            log.info("No configuration change detected: %s", hostname)
+
+        return True
+
+    except Exception as exc:
+        log.error(
+            "Backup FAILED for %s (%s): %s",
+            hostname, ip, exc,
+        )
+        return False
+
+    finally:
+        if connection is not None:
+            try:
+                connection.disconnect()
+            except Exception:
+                log.warning("Disconnect issue for %s", hostname)
+
+        # Remove incomplete temporary files after a failure.
+        if temp_path.exists():
+            try:
+                temp_path.unlink()
+            except OSError:
+                log.warning("Could not remove temporary file: %s", temp_path)
+
+
+def main():
+    try:
+        devices = read_devices()
+    except Exception:
+        log.exception("Could not load device inventory")
+        return 2
+
+    if not devices:
+        log.error("No valid devices found in Excel inventory")
+        return 2
+
+    log.info("Starting backup run for %d device(s)", len(devices))
+
+    succeeded = 0
+    failed = 0
+
+    for device in devices:
+        if backup_device(device):
+            succeeded += 1
+        else:
+            failed += 1
+
+    log.info(
+        "Backup run finished: %d succeeded, %d failed",
+        succeeded, failed,
+    )
+
+    # Nonzero exit status helps monitoring detect failures.
+    return 1 if failed else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
